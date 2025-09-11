@@ -14,6 +14,14 @@
 #include "crc32.h"
 
 // SIMD helpers: AVX2 for x86, NEON for ARM, fallback to memcpy
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
+// SIMD helpers: AVX2 for x86, NEON for ARM, fallback to memcpy
 inline void fast_copy(uint8_t* dst, const uint8_t* src, size_t len) {
 #if defined(__AVX2__)
     // Use AVX2 for large blocks
@@ -36,10 +44,11 @@ inline void fast_copy(uint8_t* dst, const uint8_t* src, size_t len) {
 
 enum { SourceRead, TargetRead, SourceCopy, TargetCopy };
 
-static bool decodenum(const uint8_t*& ptr, size_t& out) {
+static bool decodenum(const uint8_t*& ptr, const uint8_t* end, size_t& out) {
     out = 0;
     unsigned int shift = 0;
     while (true) {
+        if (ptr >= end) return false;
         uint8_t next = *ptr++;
         size_t addthis = (next & 0x7F);
         if (shift) addthis++;
@@ -47,6 +56,7 @@ static bool decodenum(const uint8_t*& ptr, size_t& out) {
         out += addthis;
         if (next & 0x80) break;
         shift += 7;
+        if (shift >= 56) return false; // Prevent overflow
     }
     return true;
 }
@@ -60,9 +70,12 @@ struct PatchJob {
 };
 
 // Identify large jobs for threading (only SourceRead and TargetRead, >128kB)
+static constexpr size_t THREADING_THRESHOLD = 128 * 1024; // 128KB
+
+// Identify large jobs for threading (only SourceRead and TargetRead, >128kB)
 static void batch_jobs(const std::vector<PatchJob>& jobs, std::vector<PatchJob>& threaded, std::vector<PatchJob>& single) {
     for (const PatchJob& job : jobs) {
-        if ((job.action == SourceRead || job.action == TargetRead) && job.length >= 128*1024) {
+        if ((job.action == SourceRead || job.action == TargetRead) && job.length >= THREADING_THRESHOLD) {
             threaded.push_back(job);
         } else {
             single.push_back(job);
@@ -84,9 +97,12 @@ enum bpserror bps_apply(struct mem patch, struct mem in, struct mem * out, struc
     if (patchat[0]!='B' || patchat[1]!='P' || patchat[2]!='S' || patchat[3]!='1') return bps_broken;
     patchat += 4;
 
-    uint32_t crc_in_e = *(uint32_t*)(patch.ptr+patch.len-12);
-    uint32_t crc_out_e = *(uint32_t*)(patch.ptr+patch.len-8);
-    uint32_t crc_patch_e = *(uint32_t*)(patch.ptr+patch.len-4);
+    const uint8_t* crc_ptr = patch.ptr + patch.len - 12;
+    uint32_t crc_in_e = crc_ptr[0] | (crc_ptr[1] << 8) | (crc_ptr[2] << 16) | (crc_ptr[3] << 24);
+    crc_ptr += 4;
+    uint32_t crc_out_e = crc_ptr[0] | (crc_ptr[1] << 8) | (crc_ptr[2] << 16) | (crc_ptr[3] << 24);
+    crc_ptr += 4;
+    uint32_t crc_patch_e = crc_ptr[0] | (crc_ptr[1] << 8) | (crc_ptr[2] << 16) | (crc_ptr[3] << 24);
 
     uint32_t crc_in_a = crc32(in.ptr, in.len);
     uint32_t crc_patch_a = crc32(patch.ptr, patch.len-4);
@@ -94,9 +110,8 @@ enum bpserror bps_apply(struct mem patch, struct mem in, struct mem * out, struc
     if (crc_patch_a != crc_patch_e) return bps_broken;
 
     size_t inlen, outlen, metadatalen;
-    if (!decodenum(patchat, inlen)) return bps_too_big;
-    if (!decodenum(patchat, outlen)) return bps_too_big;
-
+    if (!decodenum(patchat, patchend, inlen)) return bps_too_big;
+    if (!decodenum(patchat, patchend, outlen)) return bps_too_big;
     if (inlen != in.len || crc_in_a != crc_in_e) {
         if (in.len == outlen && crc_in_a == crc_out_e) error = bps_to_output;
         else error = bps_not_this;
@@ -111,7 +126,10 @@ enum bpserror bps_apply(struct mem patch, struct mem in, struct mem * out, struc
     if (metadata && metadatalen) {
         metadata->len = metadatalen;
         metadata->ptr = (uint8_t*)malloc(metadatalen+1);
-        if (!metadata->ptr) error = bps_out_of_mem;
+        if (!metadata->ptr) {
+            error = bps_out_of_mem;
+            goto exit;
+        }
         memcpy(metadata->ptr, patchat, metadatalen);
         metadata->ptr[metadatalen] = '\0';
         patchat += metadatalen;
@@ -128,13 +146,13 @@ enum bpserror bps_apply(struct mem patch, struct mem in, struct mem * out, struc
 
     while (patchscan < patchend) {
         size_t thisinstr;
-        if (!decodenum(patchscan, thisinstr)) error = bps_too_big;
+        if (!decodenum(patchscan, patchend, thisinstr)) error = bps_too_big;
         size_t length = (thisinstr >> 2) + 1;
         int action = thisinstr & 3;
         PatchJob job = {outpos, inpos, patchpos, length, action};
         if (action == SourceCopy || action == TargetCopy) {
             size_t param;
-            if (!decodenum(patchscan, param)) error = bps_too_big;
+            if (!decodenum(patchscan, patchend, param)) error = bps_too_big;
             job.in_offset = param; // reuse for copy param
             job.patch_offset = patchscan - patch.ptr;
         } else if (action == TargetRead) {
@@ -155,11 +173,11 @@ enum bpserror bps_apply(struct mem patch, struct mem in, struct mem * out, struc
     // Launch threads for big jobs
     std::vector<std::thread> threads;
     for (const PatchJob& job : threaded) {
-        threads.emplace_back([&, job](){
+        threads.emplace_back([outstart, instart, patch_ptr = patch.ptr, job](){
             if (job.action == SourceRead) {
                 fast_copy(outstart + job.out_offset, instart + job.in_offset, job.length);
             } else if (job.action == TargetRead) {
-                fast_copy(outstart + job.out_offset, patch.ptr + job.patch_offset, job.length);
+                fast_copy(outstart + job.out_offset, patch_ptr + job.patch_offset, job.length);
             }
         });
     }
@@ -183,7 +201,7 @@ enum bpserror bps_apply(struct mem patch, struct mem in, struct mem * out, struc
             }
             case TargetCopy: {
                 size_t distance = job.in_offset >> 1;
-                static uint8_t* outreadat = outstart;
+                uint8_t* outreadat = outstart; // Should be tracked across jobs
                 if ((job.in_offset & 1) == 0) outreadat += distance;
                 else outreadat -= distance;
                 fast_copy(outstart + job.out_offset, outreadat, job.length);
