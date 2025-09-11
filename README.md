@@ -19,7 +19,9 @@ Contributors attest that submitted AI outputs are original, license‑compatible
 
 (See CONTRIBUTING.md for the complete policy.)
 
+  (See CONTRIBUTING.md for the complete policy.)
 
+  1. **Generate the contribution** using an AI model (e.g., GPT‑4, Claude, LLaMA, etc.).  
 1. **Generate the contribution** using an AI model (e.g., GPT‑4, Claude, LLaMA, etc.).  
 2. Verify that the output is **fully AI‑produced**—no manual edits or human‑written sections.  
 3. If you are submitting vibe‑style code, make sure it is still **AI‑generated** and clearly labeled as such.  
@@ -39,6 +41,9 @@ Contributors attest that submitted AI outputs are original, license‑compatible
   Regenerate the content until it meets the project's standards; do not manually correct it.
 - **Is vibe coding allowed?**  
   Yes, as long as the vibe‑style code is **entirely AI‑generated** and properly labeled.  
+
+- **How do I handle binaries or assets (images, ROM patches, etc.)?**  
+  Include a sidecar text file named `<filename>.meta` with the provenance header shown above. Store generation prompts or scripts in the PR description or a `/prompts/` folder.
 
 Thank you for respecting the AI‑only policy while embracing creative AI‑driven vibe coding.
 
