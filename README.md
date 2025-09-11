@@ -33,11 +33,10 @@ Contributors attest that submitted AI outputs are original, license‑compatible
 ### FAQ
 
 - **Can I edit the AI output?**  
-  No. Any manual edits will make the contribution ineligible.
+  No. Any manual edits will make the contribution ineligible. Use an AI pass (e.g., “reformat”, “apply linter fixes”, or “regenerate with changes”) for all revisions, including urgent fixes.
 
 - **What if the AI makes a mistake?**  
   Regenerate the content until it meets the project's standards; do not manually correct it.
-
 - **Is vibe coding allowed?**  
   Yes, as long as the vibe‑style code is **entirely AI‑generated** and properly labeled.  
 
