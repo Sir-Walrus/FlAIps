@@ -43,7 +43,7 @@ Contributors attest that submitted AI outputs are original, license‑compatible
   Yes, as long as the vibe‑style code is **entirely AI‑generated** and properly labeled.  
 
 - **How do I handle binaries or assets (images, ROM patches, etc.)?**  
-  Include a sidecar text file named `<filename>.meta` with the provenance header shown above. Store generation prompts or scripts in the PR description or a `/prompts/` folder.
+  Include a sidecar text file named `<filename>.meta` with the provenance header shown above. Add: `Checksum-SHA256: <hex>`, `License: <SPDX-ID>`, and `Source: <URL or N/A>`. Store prompts or generation scripts in the PR description or a `/prompts/` folder.
 
 Thank you for respecting the AI‑only policy while embracing creative AI‑driven vibe coding.
 
