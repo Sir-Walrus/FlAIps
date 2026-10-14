@@ -1,4 +1,4 @@
-#This script creates a debug-optimized binary by default. If you're on Linux, you'll get a faster binary from make-linux.sh.
+# This script creates a debug-optimized binary by default. If you're on Linux, you'll get a faster binary from make-linux.sh.
 
 SRCDIR := $(abspath $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST))))))
 
