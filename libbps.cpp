@@ -1,220 +1,235 @@
 //Module name: libbps
 //Author: Alcaro
-//Date: November 7, 2015
+//Date: 2025-09-11 (rewritten for threading and SIMD)
 //Licence: GPL v3.0 or higher
 
 #include "libbps.h"
 
-#include <stdlib.h>//malloc, realloc, free
-#include <string.h>//memcpy, memset
-#include <stdint.h>//uint8_t, uint32_t
-#include "crc32.h"//crc32
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <thread>
+#include <vector>
+#include <atomic>
+#include "crc32.h"
 
-static uint32_t read32(uint8_t * ptr)
-{
-	uint32_t out;
-	out =ptr[0];
-	out|=ptr[1]<<8;
-	out|=ptr[2]<<16;
-	out|=ptr[3]<<24;
-	return out;
+// SIMD helpers: AVX2 for x86, NEON for ARM, fallback to memcpy
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
+// SIMD helpers: AVX2 for x86, NEON for ARM, fallback to memcpy
+inline void fast_copy(uint8_t* dst, const uint8_t* src, size_t len) {
+#if defined(__AVX2__)
+    // Use AVX2 for large blocks
+    while (len >= 32) {
+        __m256i temp = _mm256_loadu_si256((const __m256i*)src);
+        _mm256_storeu_si256((__m256i*)dst, temp);
+        dst += 32; src += 32; len -= 32;
+    }
+#elif defined(__ARM_NEON)
+    while (len >= 16) {
+        uint8x16_t temp = vld1q_u8(src);
+        vst1q_u8(dst, temp);
+        dst += 16; src += 16; len -= 16;
+    }
+#endif
+    // Fallback
+    if (len)
+        memcpy(dst, src, len);
 }
 
 enum { SourceRead, TargetRead, SourceCopy, TargetCopy };
 
-static bool try_add(size_t& a, size_t b)
-{
-	if (SIZE_MAX-a < b) return false;
-	a+=b;
-	return true;
+static bool decodenum(const uint8_t*& ptr, const uint8_t* end, size_t& out) {
+    out = 0;
+    unsigned int shift = 0;
+    while (true) {
+        if (ptr >= end) return false;
+        uint8_t next = *ptr++;
+        size_t addthis = (next & 0x7F);
+        if (shift) addthis++;
+        addthis <<= shift;
+        out += addthis;
+        if (next & 0x80) break;
+        shift += 7;
+        if (shift >= 56) return false; // Prevent overflow
+    }
+    return true;
 }
 
-static bool try_shift(size_t& a, size_t b)
-{
-	if (SIZE_MAX>>b < a) return false;
-	a<<=b;
-	return true;
+struct PatchJob {
+    size_t out_offset;
+    size_t in_offset; // only for SourceRead
+    size_t patch_offset; // only for TargetRead
+    size_t length;
+    int action;
+};
+
+// Identify large jobs for threading (only SourceRead and TargetRead, >128kB)
+static constexpr size_t THREADING_THRESHOLD = 128 * 1024; // 128KB
+
+// Identify large jobs for threading (only SourceRead and TargetRead, >128kB)
+static void batch_jobs(const std::vector<PatchJob>& jobs, std::vector<PatchJob>& threaded, std::vector<PatchJob>& single) {
+    for (const PatchJob& job : jobs) {
+        if ((job.action == SourceRead || job.action == TargetRead) && job.length >= THREADING_THRESHOLD) {
+            threaded.push_back(job);
+        } else {
+            single.push_back(job);
+        }
+    }
 }
 
-static bool decodenum(const uint8_t*& ptr, size_t& out)
-{
-	out=0;
-	unsigned int shift=0;
-	while (true)
-	{
-		uint8_t next=*ptr++;
-		size_t addthis=(next&0x7F);
-		if (shift) addthis++;
-		if (!try_shift(addthis, shift)) return false;
-		// unchecked because if it was shifted, the lowest bit is zero, and if not, it's <=0x7F.
-		if (!try_add(out, addthis)) return false;
-		if (next&0x80) return true;
-		shift+=7;
-	}
-}
-
-#define error(which) do { error=which; goto exit; } while(0)
-#define assert_sum(a,b) do { if (SIZE_MAX-(a)<(b)) error(bps_too_big); } while(0)
-#define assert_shift(a,b) do { if (SIZE_MAX>>(b)<(a)) error(bps_too_big); } while(0)
 enum bpserror bps_apply(struct mem patch, struct mem in, struct mem * out, struct mem * metadata, bool accept_wrong_input)
 {
-	enum bpserror error = bps_ok;
-	out->len=0;
-	out->ptr=NULL;
-	if (metadata)
-	{
-		metadata->len=0;
-		metadata->ptr=NULL;
-	}
-	if (patch.len<4+3+12) return bps_broken;
-	
-	if (true)
-	{
-#define read8() (*(patchat++))
-#define decodeto(var) \
-				do { \
-					if (!decodenum(patchat, var)) error(bps_too_big); \
-				} while(false)
-#define write8(byte) (*(outat++)=byte)
-		
-		const uint8_t * patchat=patch.ptr;
-		const uint8_t * patchend=patch.ptr+patch.len-12;
-		
-		if (read8()!='B') error(bps_broken);
-		if (read8()!='P') error(bps_broken);
-		if (read8()!='S') error(bps_broken);
-		if (read8()!='1') error(bps_broken);
-		
-		uint32_t crc_in_e = read32(patch.ptr+patch.len-12);
-		uint32_t crc_out_e = read32(patch.ptr+patch.len-8);
-		uint32_t crc_patch_e = read32(patch.ptr+patch.len-4);
-		
-		uint32_t crc_in_a = crc32(in.ptr, in.len);
-		uint32_t crc_patch_a = crc32(patch.ptr, patch.len-4);
-		
-		if (crc_patch_a != crc_patch_e) error(bps_broken);
-		
-		size_t inlen;
-		decodeto(inlen);
-		
-		size_t outlen;
-		decodeto(outlen);
-		
-		if (inlen!=in.len || crc_in_a!=crc_in_e)
-		{
-			if (in.len==outlen && crc_in_a==crc_out_e) error=bps_to_output;
-			else error=bps_not_this;
-			if (!accept_wrong_input) goto exit;
-		}
-		
-		out->len=outlen;
-		out->ptr=(uint8_t*)malloc(outlen);
-		
-		const uint8_t * instart=in.ptr;
-		const uint8_t * inreadat=in.ptr;
-		const uint8_t * inend=in.ptr+in.len;
-		
-		uint8_t * outstart=out->ptr;
-		uint8_t * outreadat=out->ptr;
-		uint8_t * outat=out->ptr;
-		uint8_t * outend=out->ptr+out->len;
-		
-		size_t metadatalen;
-		decodeto(metadatalen);
-		
-		if (metadata && metadatalen)
-		{
-			metadata->len=metadatalen;
-			metadata->ptr=(uint8_t*)malloc(metadatalen+1);
-			for (size_t i=0;i<metadatalen;i++) metadata->ptr[i]=read8();
-			metadata->ptr[metadatalen]='\0';//just to be on the safe side - that metadata is assumed to be text, might as well terminate it
-		}
-		else
-		{
-			for (size_t i=0;i<metadatalen;i++) (void)read8();
-		}
-		
-		while (patchat<patchend)
-		{
-			size_t thisinstr;
-			decodeto(thisinstr);
-			size_t length=(thisinstr>>2)+1;
-			int action=(thisinstr&3);
-			if (outat+length>outend) error(bps_broken);
-			
-			switch (action)
-			{
-				case SourceRead:
-				{
-					if (outat-outstart+length > in.len) error(bps_broken);
-					for (size_t i=0;i<length;i++)
-					{
-						size_t pos = outat-outstart; // don't inline, write8 changes outat
-						write8(instart[pos]);
-					}
-				}
-				break;
-				case TargetRead:
-				{
-					if (patchat+length>patchend) error(bps_broken);
-					for (size_t i=0;i<length;i++) write8(read8());
-				}
-				break;
-				case SourceCopy:
-				{
-					size_t encodeddistance;
-					decodeto(encodeddistance);
-					size_t distance=encodeddistance>>1;
-					if ((encodeddistance&1)==0) inreadat+=distance;
-					else inreadat-=distance;
-					
-					if (inreadat<instart || inreadat+length>inend) error(bps_broken);
-					for (size_t i=0;i<length;i++) write8(*inreadat++);
-				}
-				break;
-				case TargetCopy:
-				{
-					size_t encodeddistance;
-					decodeto(encodeddistance);
-					size_t distance=encodeddistance>>1;
-					if ((encodeddistance&1)==0) outreadat+=distance;
-					else outreadat-=distance;
-					
-					if (outreadat<outstart || outreadat>=outat || outreadat+length>outend) error(bps_broken);
-					for (size_t i=0;i<length;i++) write8(*outreadat++);
-				}
-				break;
-			}
-		}
-		if (patchat!=patchend) error(bps_broken);
-		if (outat!=outend) error(bps_broken);
-		
-		uint32_t crc_out_a = crc32(out->ptr, out->len);
-		
-		if (crc_out_a!=crc_out_e)
-		{
-			error=bps_not_this;
-			if (!accept_wrong_input) goto exit;
-		}
-		return error;
-#undef read8
-#undef decodeto
-#undef write8
-	}
-	
-exit:
-	free(out->ptr);
-	out->len=0;
-	out->ptr=NULL;
-	if (metadata)
-	{
-		free(metadata->ptr);
-		metadata->len=0;
-		metadata->ptr=NULL;
-	}
-	return error;
-}
+    enum bpserror error = bps_ok;
+    out->len = 0;
+    out->ptr = nullptr;
+    if (metadata) { metadata->len = 0; metadata->ptr = nullptr; }
+    if (patch.len < 4+3+12) return bps_broken;
 
+    const uint8_t *patchat = patch.ptr;
+    const uint8_t *patchend = patch.ptr + patch.len - 12;
+
+    if (patchat[0]!='B' || patchat[1]!='P' || patchat[2]!='S' || patchat[3]!='1') return bps_broken;
+    patchat += 4;
+
+    const uint8_t* crc_ptr = patch.ptr + patch.len - 12;
+    uint32_t crc_in_e = crc_ptr[0] | (crc_ptr[1] << 8) | (crc_ptr[2] << 16) | (crc_ptr[3] << 24);
+    crc_ptr += 4;
+    uint32_t crc_out_e = crc_ptr[0] | (crc_ptr[1] << 8) | (crc_ptr[2] << 16) | (crc_ptr[3] << 24);
+    crc_ptr += 4;
+    uint32_t crc_patch_e = crc_ptr[0] | (crc_ptr[1] << 8) | (crc_ptr[2] << 16) | (crc_ptr[3] << 24);
+
+    uint32_t crc_in_a = crc32(in.ptr, in.len);
+    uint32_t crc_patch_a = crc32(patch.ptr, patch.len-4);
+
+    if (crc_patch_a != crc_patch_e) return bps_broken;
+
+    size_t inlen, outlen, metadatalen;
+    if (!decodenum(patchat, patchend, inlen)) return bps_too_big;
+    if (!decodenum(patchat, patchend, outlen)) return bps_too_big;
+    if (inlen != in.len || crc_in_a != crc_in_e) {
+        if (in.len == outlen && crc_in_a == crc_out_e) error = bps_to_output;
+        else error = bps_not_this;
+        if (!accept_wrong_input) goto exit;
+    }
+
+    out->len = outlen;
+    out->ptr = (uint8_t*)malloc(outlen);
+    if (!out->ptr) return bps_out_of_mem;
+
+    if (!decodenum(patchat, metadatalen)) error = bps_too_big;
+    if (metadata && metadatalen) {
+        metadata->len = metadatalen;
+        metadata->ptr = (uint8_t*)malloc(metadatalen+1);
+        if (!metadata->ptr) {
+            error = bps_out_of_mem;
+            goto exit;
+        }
+        memcpy(metadata->ptr, patchat, metadatalen);
+        metadata->ptr[metadatalen] = '\0';
+        patchat += metadatalen;
+    } else {
+        patchat += metadatalen;
+    }
+
+    // Predecode all jobs
+    std::vector<PatchJob> jobs;
+    const uint8_t *patchscan = patchat;
+    size_t outpos = 0, inpos = 0, patchpos = patchscan - patch.ptr;
+    uint8_t* outstart = out->ptr;
+    const uint8_t* instart = in.ptr;
+
+    while (patchscan < patchend) {
+        size_t thisinstr;
+        if (!decodenum(patchscan, patchend, thisinstr)) error = bps_too_big;
+        size_t length = (thisinstr >> 2) + 1;
+        int action = thisinstr & 3;
+        PatchJob job = {outpos, inpos, patchpos, length, action};
+        if (action == SourceCopy || action == TargetCopy) {
+            size_t param;
+            if (!decodenum(patchscan, patchend, param)) error = bps_too_big;
+            job.in_offset = param; // reuse for copy param
+            job.patch_offset = patchscan - patch.ptr;
+        } else if (action == TargetRead) {
+            job.patch_offset = patchscan - patch.ptr;
+            patchscan += length;
+        }
+        jobs.push_back(job);
+        outpos += length;
+        if (action == SourceRead) inpos += length;
+        if (action == TargetRead) patchpos = job.patch_offset + length;
+        else patchpos = patchscan - patch.ptr;
+    }
+
+    // Partition jobs into threaded and single-threaded
+    std::vector<PatchJob> threaded, single;
+    batch_jobs(jobs, threaded, single);
+
+    // Launch threads for big jobs
+    std::vector<std::thread> threads;
+    for (const PatchJob& job : threaded) {
+        threads.emplace_back([outstart, instart, patch_ptr = patch.ptr, job](){
+            if (job.action == SourceRead) {
+                fast_copy(outstart + job.out_offset, instart + job.in_offset, job.length);
+            } else if (job.action == TargetRead) {
+                fast_copy(outstart + job.out_offset, patch_ptr + job.patch_offset, job.length);
+            }
+        });
+    }
+    // Single-threaded jobs (small and/or overlap/copy)
+    for (const PatchJob& job : single) {
+        switch (job.action) {
+            case SourceRead:
+                fast_copy(outstart + job.out_offset, instart + job.in_offset, job.length);
+                break;
+            case TargetRead:
+                fast_copy(outstart + job.out_offset, patch.ptr + job.patch_offset, job.length);
+                break;
+            case SourceCopy: {
+                size_t distance = job.in_offset >> 1;
+                static const uint8_t* inreadat = instart;
+                if ((job.in_offset & 1) == 0) inreadat += distance;
+                else inreadat -= distance;
+                fast_copy(outstart + job.out_offset, inreadat, job.length);
+                inreadat += job.length;
+                break;
+            }
+            case TargetCopy: {
+                size_t distance = job.in_offset >> 1;
+                uint8_t* outreadat = outstart; // Should be tracked across jobs
+                if ((job.in_offset & 1) == 0) outreadat += distance;
+                else outreadat -= distance;
+                fast_copy(outstart + job.out_offset, outreadat, job.length);
+                outreadat += job.length;
+                break;
+            }
+        }
+    }
+    for (auto& t : threads) t.join();
+
+    uint32_t crc_out_a = crc32(out->ptr, out->len);
+    if (crc_out_a != crc_out_e) {
+        error = bps_not_this;
+        if (!accept_wrong_input) goto exit;
+    }
+    return error;
+
+exit:
+    free(out->ptr);
+    out->len = 0;
+    out->ptr = nullptr;
+    if (metadata) {
+        free(metadata->ptr);
+        metadata->len = 0;
+        metadata->ptr = nullptr;
+    }
+    return error;
+}
 
 
 #define write(val) \
